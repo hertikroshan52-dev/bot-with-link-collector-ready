@@ -604,6 +604,18 @@ class BotDatabase:
         conn.close()
         return rows
 
+    def reset_link_collection_memory(self, admin_id):
+        """إعادة ضبط ذاكرة تجميع الروابط للمشرف فقط."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            DELETE FROM collected_links
+            WHERE admin_id = ?
+        ''', (admin_id,))
+        conn.commit()
+        conn.close()
+        return True
+
     def get_active_publishing_accounts(self, admin_id=None):
         """الحصول على الحسابات النشطة للنشر"""
         conn = sqlite3.connect(DB_NAME)
@@ -926,6 +938,13 @@ class TelegramBotManager:
             self.link_collection_admin_id = None
             return True
         return False
+
+    def reset_link_collection_runtime_memory(self):
+        """مسح ذاكرة التجميع المؤقتة من الرام."""
+        self.link_collection_seen_messages.clear()
+        self._send_target_cache.clear()
+        self._send_target_flood_until.clear()
+        return True
 
     async def test_session(self, session_string):
         """اختبار جلسة تيليجرام"""
@@ -1444,6 +1463,10 @@ class BotHandler:
             await self.start_link_collection(query, context)
         elif data == "stop_link_collection":
             await self.stop_link_collection(query, context)
+        elif data == "confirm_reset_link_collection":
+            await self.confirm_reset_link_collection(query, context)
+        elif data == "reset_link_collection":
+            await self.reset_link_collection(query, context)
         
         # إدارة الردود
         elif data == "private_replies":
@@ -1923,6 +1946,7 @@ class BotHandler:
             [InlineKeyboardButton("🎯 تحديد وجهات التجميع", callback_data="set_link_targets")],
             [InlineKeyboardButton("🚀 بدء تجميع الروابط", callback_data="start_link_collection")],
             [InlineKeyboardButton("⏹️ إيقاف تجميع الروابط", callback_data="stop_link_collection")],
+            [InlineKeyboardButton("♻️ إعادة ضبط ذاكرة التجميع", callback_data="confirm_reset_link_collection")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_to_main")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2040,6 +2064,43 @@ class BotHandler:
             await query.edit_message_text("⏹️ تم إيقاف تجميع الروابط.")
         else:
             await query.edit_message_text("⚠️ تجميع الروابط غير نشط حالياً.")
+
+    async def confirm_reset_link_collection(self, query, context):
+        """تأكيد إعادة ضبط ذاكرة تجميع الروابط."""
+        keyboard = [
+            [InlineKeyboardButton("✅ نعم، امسح ذاكرة التجميع", callback_data="reset_link_collection")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="back_to_link_collector")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            "⚠️ **تأكيد إعادة الضبط**\n\n"
+            "سيتم حذف كل الروابط التي تم تجميعها سابقاً، "
+            "وسيبدأ البوت بتجميع الروابط من جديد وكأنها أول مرة.\n\n"
+            "لن يتم حذف الحسابات أو وجهات التجميع.",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+
+    async def reset_link_collection(self, query, context):
+        """تنفيذ إعادة ضبط ذاكرة تجميع الروابط."""
+        admin_id = query.from_user.id
+        was_running = self.manager.link_collection_active
+
+        if was_running:
+            self.manager.stop_link_collection()
+
+        self.db.reset_link_collection_memory(admin_id)
+        self.manager.reset_link_collection_runtime_memory()
+
+        if was_running:
+            self.manager.start_link_collection(admin_id)
+
+        await query.edit_message_text(
+            "✅ تم إعادة ضبط ذاكرة التجميع بنجاح.\n\n"
+            "تم حذف الروابط القديمة والذاكرة المؤقتة.\n"
+            "الآن سيبدأ البوت بتجميع الروابط من جديد بدون اعتبار الروابط السابقة مكررة."
+        )
 
     # قسم إدارة الردود
     async def manage_replies(self, query, context):

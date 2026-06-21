@@ -18,6 +18,8 @@ from telegram import (
     InlineKeyboardMarkup,
     InputFile
 )
+from telegram.error import RetryAfter, TimedOut, NetworkError, TelegramError
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -90,6 +92,8 @@ class BotDatabase:
         """تهيئة قاعدة البيانات"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+        cursor.execute('PRAGMA journal_mode=WAL')
+        cursor.execute('PRAGMA synchronous=NORMAL')
         
         # جدول الحسابات
         cursor.execute('''
@@ -222,6 +226,35 @@ class BotDatabase:
                 collected_date DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(admin_id, link_type, link)
             )
+        ''')
+
+        # طابور إرسال دائم: إذا حصل خطأ مؤقت لا يضيع الرابط، ويعاد إرساله لاحقاً.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS link_collection_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id INTEGER,
+                link_type TEXT,
+                link TEXT,
+                target TEXT,
+                source_dialog TEXT,
+                source_account_id INTEGER,
+                account_name TEXT,
+                attempts INTEGER DEFAULT 0,
+                last_error TEXT,
+                created_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(admin_id, link_type, link)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_link_outbox_admin
+            ON link_collection_outbox(admin_id, id)
+        ''')
+
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_collected_links_admin_type_link
+            ON collected_links(admin_id, link_type, link)
         ''')
 
         # حالة فحص كل قناة/مجموعة: أول مرة يتم فحص كل التاريخ، وبعدها يتم التقاط الرسائل الجديدة فقط.
@@ -604,6 +637,103 @@ class BotDatabase:
         finally:
             conn.close()
 
+    def enqueue_link_for_sending(self, admin_id, link_type, link, target, source_dialog=None, source_account_id=None, account_name=None):
+        # إضافة رابط لطابور الإرسال بدون تكرار. لا يحفظ كمرسل إلا بعد نجاح الإرسال للقناة.
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT 1
+                FROM collected_links
+                WHERE admin_id = ? AND link_type = ? AND link = ?
+                LIMIT 1
+            """, (admin_id, link_type, link))
+            if cursor.fetchone() is not None:
+                return None
+
+            cursor.execute("""
+                INSERT INTO link_collection_outbox
+                    (admin_id, link_type, link, target, source_dialog, source_account_id, account_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (admin_id, link_type, link, target, source_dialog, source_account_id, account_name))
+            conn.commit()
+            return cursor.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+        finally:
+            conn.close()
+
+    def get_pending_outbox_links(self, admin_id, limit=1000):
+        # جلب الروابط التي لم يتم إرسالها بعد من الطابور الدائم.
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, admin_id, link_type, link, target, source_dialog, source_account_id, account_name, attempts
+            FROM link_collection_outbox
+            WHERE admin_id = ?
+            ORDER BY id ASC
+            LIMIT ?
+        """, (admin_id, int(limit)))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def mark_outbox_link_sent(self, outbox_id):
+        # نقل رابط من طابور الإرسال إلى جدول الروابط المرسلة بعد نجاح الإرسال.
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT admin_id, link_type, link, source_dialog, source_account_id
+            FROM link_collection_outbox
+            WHERE id = ?
+        """, (outbox_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False
+
+        admin_id, link_type, link, source_dialog, source_account_id = row
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO collected_links
+                    (admin_id, link_type, link, source_dialog, source_account_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (admin_id, link_type, link, source_dialog, source_account_id))
+            cursor.execute('DELETE FROM link_collection_outbox WHERE id = ?', (outbox_id,))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def mark_outbox_link_failed(self, outbox_id, error_text):
+        # تسجيل الخطأ مع إبقاء الرابط في الطابور لإعادة المحاولة لاحقاً.
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE link_collection_outbox
+            SET attempts = attempts + 1,
+                last_error = ?,
+                updated_date = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (str(error_text)[:500], outbox_id))
+        conn.commit()
+        conn.close()
+        return True
+
+    def is_collected_link(self, admin_id, link_type, link):
+        """التحقق هل الرابط تم إرساله/حفظه مسبقاً."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT 1
+            FROM collected_links
+            WHERE admin_id = ? AND link_type = ? AND link = ?
+            LIMIT 1
+        ''', (admin_id, link_type, link))
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+
     def get_collected_links_count(self, admin_id):
         """إحصائيات الروابط المجمعة للمشرف."""
         conn = sqlite3.connect(DB_NAME)
@@ -628,6 +758,10 @@ class BotDatabase:
         ''', (admin_id,))
         cursor.execute('''
             DELETE FROM link_collection_dialog_state
+            WHERE admin_id = ?
+        ''', (admin_id,))
+        cursor.execute('''
+            DELETE FROM link_collection_outbox
             WHERE admin_id = ?
         ''', (admin_id,))
         conn.commit()
@@ -715,6 +849,10 @@ class TelegramBotManager:
         # بوت الإشعارات للمالك/المشرف عند اكتمال الفحص التاريخي الأول.
         self.notify_bot = Bot(BOT_TOKEN)
         self.link_collection_initial_cycle_notified = False
+        self.link_send_queue = None
+        self.link_sender_tasks = []
+        self._queued_outbox_ids = set()
+        self._target_next_send_time = {}
 
     def _remember_message(self, storage, key):
         """حفظ الرسائل التي تمت معالجتها لمنع تكرار الردود."""
@@ -819,9 +957,48 @@ class TelegramBotManager:
         self._send_target_cache[cache_key] = resolved
         return resolved
 
-    async def _send_collected_link(self, client, account_id, target, link_type, link, source_dialog, account_name):
-        """إرسال الرابط للوجهة المحددة مع كاش للوجهة واحترام FloodWait."""
-        target = str(target).strip()
+    def _normalize_bot_send_target(self, target):
+        """تحويل وجهة الإرسال إلى صيغة يقبلها Bot API.
+
+        الصيغ المقبولة:
+        - @channel_username
+        - channel_username
+        - https://t.me/channel_username
+        - -1001234567890
+
+        روابط الدعوة الخاصة مثل https://t.me/+xxxx لا تصلح كوجهة إرسال للبوت.
+        """
+        target = str(target or "").strip()
+        target = target.replace("https://t.me/", "")
+        target = target.replace("http://t.me/", "")
+        target = target.replace("https://telegram.me/", "")
+        target = target.replace("http://telegram.me/", "")
+        target = target.replace("t.me/", "")
+        target = target.replace("telegram.me/", "")
+        target = target.strip().strip("/")
+
+        if not target:
+            raise ValueError("وجهة الإرسال فارغة")
+
+        # ID رقمي مثل -1001234567890
+        if re.fullmatch(r"-?\d+", target):
+            return int(target)
+
+        # Bot API لا يستطيع الإرسال إلى رابط دعوة خاص كوجهة.
+        if target.startswith("+") or target.lower().startswith("joinchat/"):
+            raise ValueError("استخدم @username للقناة أو آيدي القناة -100... وليس رابط دعوة خاص")
+
+        if target.startswith("@"):
+            return target
+
+        if re.fullmatch(r"[A-Za-z0-9_]{5,32}", target):
+            return f"@{target}"
+
+        return target
+
+    async def _send_collected_link(self, target, link_type, link, source_dialog, account_name):
+        # إرسال الرابط فوراً إلى قناة التخزين عن طريق البوت نفسه. لا يتم فتح الرابط ولا فحصه.
+        # يرجع: (نجاح, مدة انتظار عند الخطأ المؤقت, نص الخطأ)
         label = "تليجرام" if link_type == 'telegram' else "واتساب"
         message = (
             f"🔗 رابط {label} جديد\n"
@@ -830,38 +1007,107 @@ class TelegramBotManager:
             f"👤 الحساب: {account_name or 'غير معروف'}"
         )
 
-        flood_key = (account_id, target)
-        now = time.time()
-        flood_until = self._send_target_flood_until.get(flood_key, 0)
-        if flood_until > now:
-            remaining = int(flood_until - now)
-            logger.warning(
-                f"تخطي الإرسال مؤقتاً إلى {target} للحساب #{account_id}. "
-                f"الوقت المتبقي بسبب FloodWait: {remaining} ثانية"
-            )
-            return False
-
         try:
-            resolved_target = await self._resolve_send_target(client, account_id, target)
-            await client.send_message(resolved_target, message)
-            return True
+            chat_id = self._normalize_bot_send_target(target)
 
-        except FloodWaitError as e:
-            wait_seconds = int(getattr(e, 'seconds', 0) or 0)
-            # لا نحاول مرة أخرى لنفس الحساب/الوجهة قبل انتهاء المهلة التي طلبها تيليجرام.
-            self._send_target_flood_until[flood_key] = time.time() + max(wait_seconds, 60)
-            wait_hours = round(wait_seconds / 3600, 2)
-            logger.error(
-                f"FloodWait عند الإرسال/حل الوجهة {target} للحساب #{account_id}: "
-                f"يجب الانتظار {wait_seconds} ثانية ≈ {wait_hours} ساعة"
+            # تبريد بسيط لكل قناة حتى لا يتوقف البوت بسبب RetryAfter.
+            # هذا ليس فحصاً للروابط؛ فقط تنظيم إرسال الرسائل للقناة.
+            delay = float(os.environ.get('LINK_SEND_DELAY', '0.35'))
+            target_key = str(chat_id)
+            now = time.time()
+            next_allowed = self._target_next_send_time.get(target_key, 0)
+            if next_allowed > now:
+                await asyncio.sleep(next_allowed - now)
+            self._target_next_send_time[target_key] = time.time() + max(delay, 0)
+
+            await self.notify_bot.send_message(
+                chat_id=chat_id,
+                text=message,
+                disable_web_page_preview=True
             )
-            # إذا حدث FloodWait أثناء حل اليوزرنيم، نمسح الكاش حتى لا يحتفظ بوجهة غير مكتملة.
-            self._send_target_cache.pop((account_id, target), None)
-            return False
+            return True, 0, None
 
+        except RetryAfter as e:
+            retry_after = int(getattr(e, 'retry_after', 5) or 5)
+            logger.warning(f"Bot API RetryAfter عند الإرسال إلى {target}: {retry_after} ثانية")
+            return False, max(retry_after, 1), f"RetryAfter {retry_after}s"
+        except (TimedOut, NetworkError) as e:
+            logger.warning(f"خطأ شبكة مؤقت عند الإرسال إلى {target}: {str(e)}")
+            return False, 10, str(e)
+        except TelegramError as e:
+            logger.error(f"فشل إرسال الرابط عبر البوت إلى {target}: {str(e)}")
+            return False, 60, str(e)
         except Exception as e:
-            logger.error(f"فشل الإرسال إلى الوجهة {target} للحساب #{account_id}: {str(e)}")
+            logger.error(f"خطأ غير متوقع أثناء إرسال الرابط إلى {target}: {str(e)}")
+            return False, 60, str(e)
+
+    async def _enqueue_outbox_row(self, row):
+        # وضع صف من طابور قاعدة البيانات داخل طابور الرام للإرسال السريع.
+        if self.link_send_queue is None:
             return False
+        outbox_id = row[0]
+        if outbox_id in self._queued_outbox_ids:
+            return False
+        self._queued_outbox_ids.add(outbox_id)
+        await self.link_send_queue.put(row)
+        return True
+
+    async def _load_pending_outbox(self, admin_id):
+        # تحميل أي روابط قديمة لم تُرسل بسبب إعادة تشغيل أو خطأ مؤقت.
+        rows = self.db.get_pending_outbox_links(admin_id, limit=5000)
+        loaded = 0
+        for row in rows:
+            if await self._enqueue_outbox_row(row):
+                loaded += 1
+        if loaded:
+            logger.info(f"تم تحميل {loaded} رابط من طابور الإرسال الدائم")
+        return loaded
+
+    async def _link_sender_worker(self, worker_id):
+        # عامل إرسال مستقل: يرسل الروابط من الطابور دون تعطيل فحص الرسائل.
+        while self.link_collection_active:
+            try:
+                row = await asyncio.wait_for(self.link_send_queue.get(), timeout=3)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"عامل الإرسال #{worker_id} توقف مؤقتاً: {str(e)}")
+                await asyncio.sleep(2)
+                continue
+
+            outbox_id, admin_id, link_type, link, target, source_dialog, source_account_id, account_name, attempts = row
+            try:
+                ok, retry_after, error_text = await self._send_collected_link(
+                    target=target,
+                    link_type=link_type,
+                    link=link,
+                    source_dialog=source_dialog,
+                    account_name=account_name,
+                )
+                if ok:
+                    self.db.mark_outbox_link_sent(outbox_id)
+                    logger.info(f"تم إرسال وحفظ الرابط #{outbox_id}: {link}")
+                    self._queued_outbox_ids.discard(outbox_id)
+                else:
+                    self.db.mark_outbox_link_failed(outbox_id, error_text or 'send failed')
+                    await asyncio.sleep(min(max(int(retry_after or 10), 3), 300))
+                    if self.link_collection_active:
+                        self._queued_outbox_ids.discard(outbox_id)
+                        rows = self.db.get_pending_outbox_links(admin_id, limit=5000)
+                        for pending in rows:
+                            if pending[0] == outbox_id:
+                                await self._enqueue_outbox_row(pending)
+                                break
+            except Exception as e:
+                self.db.mark_outbox_link_failed(outbox_id, str(e))
+                self._queued_outbox_ids.discard(outbox_id)
+                logger.error(f"خطأ داخل عامل الإرسال #{worker_id} للرابط #{outbox_id}: {str(e)}")
+                await asyncio.sleep(5)
+            finally:
+                try:
+                    self.link_send_queue.task_done()
+                except Exception:
+                    pass
 
     async def _notify_initial_collection_finished(self, admin_id, scanned_accounts, scanned_dialogs, historical_dialogs, new_telegram, new_whatsapp):
         """إرسال إشعار للمشرف بعد اكتمال أول دورة فحص كاملة."""
@@ -878,7 +1124,7 @@ class TelegramBotManager:
             f"🆕 روابط واتساب الجديدة في هذه الدورة: {new_whatsapp}\n\n"
             f"📊 إجمالي روابط تليجرام المحفوظة: {total_telegram}\n"
             f"📊 إجمالي روابط واتساب المحفوظة: {total_whatsapp}\n\n"
-            "🔄 سيستمر البوت الآن في التقاط الروابط الجديدة التي تنزل مستقبلًا."
+            "🔄 سيستمر البوت الآن في التقاط الروابط الجديدة التي تنزل مستقبلًا وإرسالها فوراً."
         )
         try:
             await self.notify_bot.send_message(chat_id=notify_chat_id, text=text)
@@ -886,153 +1132,195 @@ class TelegramBotManager:
             logger.error(f"فشل إرسال إشعار اكتمال التجميع إلى {notify_chat_id}: {str(e)}")
 
     async def collect_links_from_accounts(self, admin_id=None):
-        """تجميع روابط واتساب وتليجرام من كل رسائل مجموعات وقنوات الحسابات المضافة.
-
-        أول مرة لكل قناة/مجموعة: يتم فحص كل الرسائل المتاحة تاريخياً.
-        بعد ذلك: يتم فحص الرسائل الجديدة فقط اعتماداً على آخر message_id محفوظ.
-        لا يتم فتح الروابط المجمعة ولا التحقق منها عبر get_entity.
-        """
+        # تجميع روابط واتساب وتليجرام من كل رسائل مجموعات وقنوات الحسابات المضافة.
+        # لا يتم فتح الروابط ولا التحقق منها ولا الدخول عليها.
+        # الإرسال يتم فور العثور على الرابط عبر طابور إرسال مستقل حتى لا يتوقف الفحص.
         scan_interval = int(os.environ.get('LINK_COLLECT_INTERVAL', '900'))
+        queue_size = int(os.environ.get('LINK_SEND_QUEUE_SIZE', '50000'))
+        sender_workers = int(os.environ.get('LINK_SENDER_WORKERS', '3'))
+        sender_workers = max(1, min(sender_workers, 10))
 
-        while self.link_collection_active:
-            try:
-                settings = self.db.get_link_collection_settings(admin_id)
-                if not settings:
-                    logger.warning("لا توجد وجهات محفوظة لتجميع الروابط")
-                    await self._controlled_sleep(30, 'link_collection_active')
-                    continue
+        self.link_send_queue = asyncio.Queue(maxsize=max(queue_size, 1000))
+        self._queued_outbox_ids.clear()
+        self.link_sender_tasks = [
+            asyncio.create_task(self._link_sender_worker(i + 1))
+            for i in range(sender_workers)
+        ]
 
-                telegram_target, whatsapp_target, _updated_date = settings
-                accounts = self.db.get_active_publishing_accounts(admin_id)
+        try:
+            await self._load_pending_outbox(admin_id)
 
-                if not accounts:
-                    logger.warning("لا توجد حسابات نشطة لتجميع الروابط")
-                    await self._controlled_sleep(60, 'link_collection_active')
-                    continue
-
-                cycle_new_telegram = 0
-                cycle_new_whatsapp = 0
-                scanned_accounts = 0
-                scanned_dialogs = 0
-                historical_dialogs = 0
-
-                for account in accounts:
-                    if not self.link_collection_active:
-                        break
-
-                    account_id, session_string, name, username = account
-                    client = None
-
-                    try:
-                        client = TelegramClient(StringSession(session_string), 1, "b")
-                        await client.connect()
-
-                        if not await client.is_user_authorized():
-                            await client.disconnect()
-                            continue
-
-                        scanned_accounts += 1
-                        dialogs = await client.get_dialogs()
-
-                        for dialog in dialogs:
-                            if not self.link_collection_active:
-                                break
-
-                            # فحص القنوات والمجموعات فقط، وتجاهل الخاص.
-                            if not (dialog.is_group or dialog.is_channel):
-                                continue
-
-                            dialog_id = int(dialog.id)
-                            scanned_dialogs += 1
-
-                            state = self.db.get_link_collection_dialog_state(admin_id, account_id, dialog_id)
-                            if state:
-                                last_message_id, full_scan_done = state
-                                last_message_id = int(last_message_id or 0)
-                                full_scan_done = bool(full_scan_done)
-                            else:
-                                last_message_id = 0
-                                full_scan_done = False
-
-                            iter_kwargs = {}
-                            if full_scan_done and last_message_id > 0:
-                                # بعد اكتمال الفحص التاريخي، نلتقط الرسائل الأحدث فقط.
-                                iter_kwargs['min_id'] = last_message_id
-                            else:
-                                # أول مرة لهذه القناة/المجموعة: فحص كل الرسائل المتاحة.
-                                historical_dialogs += 1
-
-                            max_seen_message_id = last_message_id
-
-                            try:
-                                async for message in client.iter_messages(dialog.id, limit=None, **iter_kwargs):
-                                    if not self.link_collection_active:
-                                        break
-
-                                    message_id = int(getattr(message, 'id', 0) or 0)
-                                    if message_id > max_seen_message_id:
-                                        max_seen_message_id = message_id
-
-                                    text = getattr(message, 'message', None) or getattr(message, 'text', None) or ''
-                                    links = self.extract_group_links(text)
-
-                                    for link in sorted(links['telegram']):
-                                        # لا يوجد أي فحص للرابط نفسه. فقط حفظ ومنع تكرار ثم إرسال.
-                                        if self.db.add_collected_link(admin_id, 'telegram', link, dialog.name, account_id):
-                                            sent = await self._send_collected_link(client, account_id, telegram_target, 'telegram', link, dialog.name, name)
-                                            cycle_new_telegram += 1
-                                            if sent:
-                                                logger.info(f"تم إرسال رابط تليجرام جديد: {link}")
-                                                await asyncio.sleep(5)
-                                            else:
-                                                await asyncio.sleep(2)
-
-                                    for link in sorted(links['whatsapp']):
-                                        if self.db.add_collected_link(admin_id, 'whatsapp', link, dialog.name, account_id):
-                                            sent = await self._send_collected_link(client, account_id, whatsapp_target, 'whatsapp', link, dialog.name, name)
-                                            cycle_new_whatsapp += 1
-                                            if sent:
-                                                logger.info(f"تم إرسال رابط واتساب جديد: {link}")
-                                                await asyncio.sleep(5)
-                                            else:
-                                                await asyncio.sleep(2)
-
-                                # نحفظ آخر رسالة شوهدت حتى لا نعيد فحص التاريخ كاملاً في كل دورة.
-                                self.db.update_link_collection_dialog_state(
-                                    admin_id, account_id, dialog_id, max_seen_message_id, True
-                                )
-
-                            except Exception as e:
-                                logger.error(f"فشل فحص {dialog.name}: {str(e)}")
-                                continue
-
-                        await client.disconnect()
-
-                    except Exception as e:
-                        logger.error(f"خطأ أثناء تجميع الروابط من الحساب {name}: {str(e)}")
-                        if client:
-                            try:
-                                await client.disconnect()
-                            except Exception:
-                                pass
+            while self.link_collection_active:
+                try:
+                    settings = self.db.get_link_collection_settings(admin_id)
+                    if not settings:
+                        logger.warning("لا توجد وجهات محفوظة لتجميع الروابط")
+                        await self._controlled_sleep(30, 'link_collection_active')
                         continue
 
-                if self.link_collection_active and not self.link_collection_initial_cycle_notified:
-                    await self._notify_initial_collection_finished(
-                        admin_id=admin_id,
-                        scanned_accounts=scanned_accounts,
-                        scanned_dialogs=scanned_dialogs,
-                        historical_dialogs=historical_dialogs,
-                        new_telegram=cycle_new_telegram,
-                        new_whatsapp=cycle_new_whatsapp,
-                    )
-                    self.link_collection_initial_cycle_notified = True
+                    telegram_target, whatsapp_target, _updated_date = settings
+                    accounts = self.db.get_active_publishing_accounts(admin_id)
 
-                await self._controlled_sleep(scan_interval, 'link_collection_active')
+                    if not accounts:
+                        logger.warning("لا توجد حسابات نشطة لتجميع الروابط")
+                        await self._controlled_sleep(60, 'link_collection_active')
+                        continue
 
-            except Exception as e:
-                logger.error(f"خطأ عام في تجميع الروابط: {str(e)}")
-                await self._controlled_sleep(60, 'link_collection_active')
+                    cycle_new_telegram = 0
+                    cycle_new_whatsapp = 0
+                    scanned_accounts = 0
+                    scanned_dialogs = 0
+                    historical_dialogs = 0
+
+                    for account in accounts:
+                        if not self.link_collection_active:
+                            break
+
+                        account_id, session_string, name, username = account
+                        client = None
+
+                        try:
+                            client = TelegramClient(StringSession(session_string), 1, "b")
+                            await client.connect()
+
+                            if not await client.is_user_authorized():
+                                await client.disconnect()
+                                continue
+
+                            scanned_accounts += 1
+                            dialogs = await client.get_dialogs()
+
+                            for dialog in dialogs:
+                                if not self.link_collection_active:
+                                    break
+
+                                # فحص القنوات والمجموعات فقط، وتجاهل الخاص.
+                                if not (dialog.is_group or dialog.is_channel):
+                                    continue
+
+                                dialog_id = int(dialog.id)
+                                scanned_dialogs += 1
+
+                                state = self.db.get_link_collection_dialog_state(admin_id, account_id, dialog_id)
+                                if state:
+                                    last_message_id, full_scan_done = state
+                                    last_message_id = int(last_message_id or 0)
+                                    full_scan_done = bool(full_scan_done)
+                                else:
+                                    last_message_id = 0
+                                    full_scan_done = False
+
+                                iter_kwargs = {}
+                                if full_scan_done and last_message_id > 0:
+                                    iter_kwargs['min_id'] = last_message_id
+                                else:
+                                    historical_dialogs += 1
+
+                                max_seen_message_id = last_message_id
+
+                                try:
+                                    async for message in client.iter_messages(dialog.id, limit=None, **iter_kwargs):
+                                        if not self.link_collection_active:
+                                            break
+
+                                        message_id = int(getattr(message, 'id', 0) or 0)
+                                        if message_id > max_seen_message_id:
+                                            max_seen_message_id = message_id
+
+                                        text = getattr(message, 'message', None) or getattr(message, 'text', None) or ''
+                                        links = self.extract_group_links(text)
+
+                                        for link in links['telegram']:
+                                            if self.db.is_collected_link(admin_id, 'telegram', link):
+                                                continue
+                                            outbox_id = self.db.enqueue_link_for_sending(
+                                                admin_id=admin_id,
+                                                link_type='telegram',
+                                                link=link,
+                                                target=telegram_target,
+                                                source_dialog=dialog.name,
+                                                source_account_id=account_id,
+                                                account_name=name,
+                                            )
+                                            if outbox_id:
+                                                row = (outbox_id, admin_id, 'telegram', link, telegram_target, dialog.name, account_id, name, 0)
+                                                await self._enqueue_outbox_row(row)
+                                                cycle_new_telegram += 1
+
+                                        for link in links['whatsapp']:
+                                            if self.db.is_collected_link(admin_id, 'whatsapp', link):
+                                                continue
+                                            outbox_id = self.db.enqueue_link_for_sending(
+                                                admin_id=admin_id,
+                                                link_type='whatsapp',
+                                                link=link,
+                                                target=whatsapp_target,
+                                                source_dialog=dialog.name,
+                                                source_account_id=account_id,
+                                                account_name=name,
+                                            )
+                                            if outbox_id:
+                                                row = (outbox_id, admin_id, 'whatsapp', link, whatsapp_target, dialog.name, account_id, name, 0)
+                                                await self._enqueue_outbox_row(row)
+                                                cycle_new_whatsapp += 1
+
+                                    self.db.update_link_collection_dialog_state(
+                                        admin_id, account_id, dialog_id, max_seen_message_id, True
+                                    )
+
+                                except FloodWaitError as e:
+                                    wait_seconds = int(getattr(e, 'seconds', 60) or 60)
+                                    logger.warning(f"FloodWait أثناء قراءة الرسائل من {dialog.name}: انتظار {wait_seconds} ثانية")
+                                    await self._controlled_sleep(min(wait_seconds, 600), 'link_collection_active')
+                                    continue
+                                except Exception as e:
+                                    logger.error(f"فشل فحص {dialog.name}: {str(e)}")
+                                    continue
+
+                            await client.disconnect()
+
+                        except FloodWaitError as e:
+                            wait_seconds = int(getattr(e, 'seconds', 60) or 60)
+                            logger.warning(f"FloodWait على الحساب {name}: انتظار {wait_seconds} ثانية")
+                            if client:
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
+                            await self._controlled_sleep(min(wait_seconds, 600), 'link_collection_active')
+                            continue
+                        except Exception as e:
+                            logger.error(f"خطأ أثناء تجميع الروابط من الحساب {name}: {str(e)}")
+                            if client:
+                                try:
+                                    await client.disconnect()
+                                except Exception:
+                                    pass
+                            continue
+
+                    if self.link_collection_active and not self.link_collection_initial_cycle_notified:
+                        await self._notify_initial_collection_finished(
+                            admin_id=admin_id,
+                            scanned_accounts=scanned_accounts,
+                            scanned_dialogs=scanned_dialogs,
+                            historical_dialogs=historical_dialogs,
+                            new_telegram=cycle_new_telegram,
+                            new_whatsapp=cycle_new_whatsapp,
+                        )
+                        self.link_collection_initial_cycle_notified = True
+
+                    await self._load_pending_outbox(admin_id)
+                    await self._controlled_sleep(scan_interval, 'link_collection_active')
+
+                except Exception as e:
+                    logger.error(f"خطأ عام في تجميع الروابط: {str(e)}")
+                    await self._controlled_sleep(60, 'link_collection_active')
+        finally:
+            for task in self.link_sender_tasks:
+                task.cancel()
+            self.link_sender_tasks = []
+            self.link_send_queue = None
+            self._queued_outbox_ids.clear()
 
     def start_link_collection(self, admin_id=None):
         """بدء تجميع الروابط."""
@@ -1064,6 +1352,8 @@ class TelegramBotManager:
         self._send_target_cache.clear()
         self._send_target_flood_until.clear()
         self.link_collection_initial_cycle_notified = False
+        self._queued_outbox_ids.clear()
+        self._target_next_send_time.clear()
         return True
 
     async def test_session(self, session_string):
@@ -2833,7 +3123,7 @@ class BotHandler:
         
         print("🤖 البوت يعمل الآن...")
         print(f"✅ تم إضافة الآيدي {OWNER_ID} كمشرف رئيسي")
-        print("🎯 البوت جاهز للتشغيل بعد الإصلاحات")
+        print("🎯 البوت جاهز: تجميع سريع مباشر عبر طابور إرسال بدون فحص أو فتح الروابط")
         
         self.application.run_polling()
 

@@ -12,6 +12,7 @@ from threading import Thread
 from queue import Queue
 
 from telegram import (
+    Bot,
     Update, 
     InlineKeyboardButton, 
     InlineKeyboardMarkup,
@@ -220,6 +221,19 @@ class BotDatabase:
                 source_account_id INTEGER,
                 collected_date DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(admin_id, link_type, link)
+            )
+        ''')
+
+        # حالة فحص كل قناة/مجموعة: أول مرة يتم فحص كل التاريخ، وبعدها يتم التقاط الرسائل الجديدة فقط.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS link_collection_dialog_state (
+                admin_id INTEGER,
+                account_id INTEGER,
+                dialog_id INTEGER,
+                last_message_id INTEGER DEFAULT 0,
+                full_scan_done BOOLEAN DEFAULT 0,
+                updated_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (admin_id, account_id, dialog_id)
             )
         ''')
         
@@ -612,6 +626,40 @@ class BotDatabase:
             DELETE FROM collected_links
             WHERE admin_id = ?
         ''', (admin_id,))
+        cursor.execute('''
+            DELETE FROM link_collection_dialog_state
+            WHERE admin_id = ?
+        ''', (admin_id,))
+        conn.commit()
+        conn.close()
+        return True
+
+    def get_link_collection_dialog_state(self, admin_id, account_id, dialog_id):
+        """جلب آخر رسالة تم فحصها في قناة/مجموعة معينة."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT last_message_id, full_scan_done
+            FROM link_collection_dialog_state
+            WHERE admin_id = ? AND account_id = ? AND dialog_id = ?
+        ''', (admin_id, account_id, dialog_id))
+        result = cursor.fetchone()
+        conn.close()
+        return result
+
+    def update_link_collection_dialog_state(self, admin_id, account_id, dialog_id, last_message_id, full_scan_done=True):
+        """حفظ حالة فحص قناة/مجموعة حتى لا يعاد فحص التاريخ كله في كل دورة."""
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO link_collection_dialog_state
+                (admin_id, account_id, dialog_id, last_message_id, full_scan_done, updated_date)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(admin_id, account_id, dialog_id) DO UPDATE SET
+                last_message_id = MAX(link_collection_dialog_state.last_message_id, excluded.last_message_id),
+                full_scan_done = excluded.full_scan_done,
+                updated_date = CURRENT_TIMESTAMP
+        ''', (admin_id, account_id, dialog_id, int(last_message_id or 0), 1 if full_scan_done else 0))
         conn.commit()
         conn.close()
         return True
@@ -664,6 +712,9 @@ class TelegramBotManager:
         self._send_target_cache = {}
         # تبريد مؤقت عند حدوث FloodWait حتى لا يكرر نفس الخطأ آلاف المرات.
         self._send_target_flood_until = {}
+        # بوت الإشعارات للمالك/المشرف عند اكتمال الفحص التاريخي الأول.
+        self.notify_bot = Bot(BOT_TOKEN)
+        self.link_collection_initial_cycle_notified = False
 
     def _remember_message(self, storage, key):
         """حفظ الرسائل التي تمت معالجتها لمنع تكرار الردود."""
@@ -685,62 +736,57 @@ class TelegramBotManager:
         return True
     
     def extract_group_links(self, text):
-        """استخراج روابط مجموعات واتساب وتليجرام فقط من نص الرسالة."""
+        """استخراج كل روابط تليجرام وواتساب من النص بدون فتحها أو التحقق منها.
+
+        القاعدة الوحيدة: تجاهل رابط تليجرام إذا كان اسم المسار الأول ينتهي بكلمة bot.
+        مثال يتم تجاهله: https://t.me/examplebot
+        """
         if not text:
             return {"telegram": set(), "whatsapp": set()}
 
         results = {"telegram": set(), "whatsapp": set()}
         trailing = '.,;:!?)"]}،؛\n\r\t '
 
-        # روابط مجموعات واتساب تكون غالباً بهذا الشكل: chat.whatsapp.com/<code>
+        # روابط واتساب: chat.whatsapp.com/<code>
         whatsapp_pattern = re.compile(
             r'(?:https?://)?chat\.whatsapp\.com/[A-Za-z0-9_-]{10,}',
             re.IGNORECASE
         )
         for match in whatsapp_pattern.findall(text):
             link = match.strip().strip(trailing)
+            link = link.split('?', 1)[0].split('#', 1)[0]
             if not link.startswith(('http://', 'https://')):
                 link = 'https://' + link
             results["whatsapp"].add(link)
 
-        # روابط تليجرام: خاص t.me/+hash أو joinchat أو عام t.me/username
+        # كل روابط تليجرام t.me و telegram.me بدون فحص أو get_entity.
         telegram_pattern = re.compile(
-            r'(?:https?://)?(?:t\.me|telegram\.me)/[^\s<>"\']+',
+            r'''(?:https?://)?(?:t\.me|telegram\.me)/[^\s<>"']+''',
             re.IGNORECASE
         )
-        blocked_first_segments = {
-            'share', 'addstickers', 'addemoji', 'proxy', 'socks', 'iv', 'login',
-            'bg', 'boost', 'c', 'invoice', 'giftcode', 'nft'
-        }
-
         for match in telegram_pattern.findall(text):
             raw = match.strip().strip(trailing)
             clean = re.sub(r'^https?://', '', raw, flags=re.IGNORECASE)
             clean = clean.split('?', 1)[0].split('#', 1)[0].strip('/')
+
             parts = clean.split('/')
             if len(parts) < 2:
                 continue
 
-            path_parts = [part for part in parts[1:] if part]
+            domain = parts[0].lower()
+            path_parts = [part.strip().strip(trailing) for part in parts[1:] if part.strip().strip(trailing)]
             if not path_parts:
                 continue
 
-            first = path_parts[0]
-            first_lower = first.lower()
-            if first_lower in blocked_first_segments:
+            # استثناء روابط تليجرام التي ينتهي اسمها الأول بكلمة bot فقط.
+            # أمثلة مستثناة: t.me/namebot أو telegram.me/namebot
+            first_segment = path_parts[0]
+            if first_segment.lower().endswith('bot'):
                 continue
 
-            if first.startswith('+') and len(first) > 3:
-                results["telegram"].add(f"https://t.me/{first}")
-                continue
-
-            if first_lower == 'joinchat' and len(path_parts) >= 2 and len(path_parts[1]) > 3:
-                results["telegram"].add(f"https://t.me/joinchat/{path_parts[1]}")
-                continue
-
-            # للروابط العامة نأخذ اسم المستخدم فقط ونتجاهل روابط الرسائل /123
-            if re.fullmatch(r'[A-Za-z0-9_]{5,32}', first):
-                results["telegram"].add(f"https://t.me/{first}")
+            normalized_path = '/'.join(path_parts)
+            if domain in ('t.me', 'telegram.me'):
+                results["telegram"].add(f"https://t.me/{normalized_path}")
 
         return results
 
@@ -817,9 +863,35 @@ class TelegramBotManager:
             logger.error(f"فشل الإرسال إلى الوجهة {target} للحساب #{account_id}: {str(e)}")
             return False
 
+    async def _notify_initial_collection_finished(self, admin_id, scanned_accounts, scanned_dialogs, historical_dialogs, new_telegram, new_whatsapp):
+        """إرسال إشعار للمشرف بعد اكتمال أول دورة فحص كاملة."""
+        notify_chat_id = admin_id or OWNER_ID
+        counts = self.db.get_collected_links_count(admin_id)
+        total_telegram = counts.get('telegram', 0)
+        total_whatsapp = counts.get('whatsapp', 0)
+        text = (
+            "✅ اكتمل التجميع التاريخي للروابط.\n\n"
+            f"👥 الحسابات المفحوصة: {scanned_accounts}\n"
+            f"📚 القنوات/المجموعات المفحوصة: {scanned_dialogs}\n"
+            f"🧾 القنوات/المجموعات التي تم فحص تاريخها كاملًا: {historical_dialogs}\n\n"
+            f"🆕 روابط تليجرام الجديدة في هذه الدورة: {new_telegram}\n"
+            f"🆕 روابط واتساب الجديدة في هذه الدورة: {new_whatsapp}\n\n"
+            f"📊 إجمالي روابط تليجرام المحفوظة: {total_telegram}\n"
+            f"📊 إجمالي روابط واتساب المحفوظة: {total_whatsapp}\n\n"
+            "🔄 سيستمر البوت الآن في التقاط الروابط الجديدة التي تنزل مستقبلًا."
+        )
+        try:
+            await self.notify_bot.send_message(chat_id=notify_chat_id, text=text)
+        except Exception as e:
+            logger.error(f"فشل إرسال إشعار اكتمال التجميع إلى {notify_chat_id}: {str(e)}")
+
     async def collect_links_from_accounts(self, admin_id=None):
-        """تجميع روابط واتساب وتليجرام من مجموعات وقنوات الحسابات المضافة."""
-        scan_limit = int(os.environ.get('LINK_COLLECT_SCAN_LIMIT', '10'))
+        """تجميع روابط واتساب وتليجرام من كل رسائل مجموعات وقنوات الحسابات المضافة.
+
+        أول مرة لكل قناة/مجموعة: يتم فحص كل الرسائل المتاحة تاريخياً.
+        بعد ذلك: يتم فحص الرسائل الجديدة فقط اعتماداً على آخر message_id محفوظ.
+        لا يتم فتح الروابط المجمعة ولا التحقق منها عبر get_entity.
+        """
         scan_interval = int(os.environ.get('LINK_COLLECT_INTERVAL', '900'))
 
         while self.link_collection_active:
@@ -838,6 +910,12 @@ class TelegramBotManager:
                     await self._controlled_sleep(60, 'link_collection_active')
                     continue
 
+                cycle_new_telegram = 0
+                cycle_new_whatsapp = 0
+                scanned_accounts = 0
+                scanned_dialogs = 0
+                historical_dialogs = 0
+
                 for account in accounts:
                     if not self.link_collection_active:
                         break
@@ -853,33 +931,56 @@ class TelegramBotManager:
                             await client.disconnect()
                             continue
 
+                        scanned_accounts += 1
                         dialogs = await client.get_dialogs()
+
                         for dialog in dialogs:
                             if not self.link_collection_active:
                                 break
 
-                            # التجميع فقط من المجموعات والقنوات، وتجاهل الخاص وأي شيء آخر.
+                            # فحص القنوات والمجموعات فقط، وتجاهل الخاص.
                             if not (dialog.is_group or dialog.is_channel):
                                 continue
 
+                            dialog_id = int(dialog.id)
+                            scanned_dialogs += 1
+
+                            state = self.db.get_link_collection_dialog_state(admin_id, account_id, dialog_id)
+                            if state:
+                                last_message_id, full_scan_done = state
+                                last_message_id = int(last_message_id or 0)
+                                full_scan_done = bool(full_scan_done)
+                            else:
+                                last_message_id = 0
+                                full_scan_done = False
+
+                            iter_kwargs = {}
+                            if full_scan_done and last_message_id > 0:
+                                # بعد اكتمال الفحص التاريخي، نلتقط الرسائل الأحدث فقط.
+                                iter_kwargs['min_id'] = last_message_id
+                            else:
+                                # أول مرة لهذه القناة/المجموعة: فحص كل الرسائل المتاحة.
+                                historical_dialogs += 1
+
+                            max_seen_message_id = last_message_id
+
                             try:
-                                async for message in client.iter_messages(dialog.id, limit=scan_limit):
+                                async for message in client.iter_messages(dialog.id, limit=None, **iter_kwargs):
                                     if not self.link_collection_active:
                                         break
 
-                                    msg_key = (account_id, dialog.id, message.id)
-                                    if not self._remember_message(self.link_collection_seen_messages, msg_key):
-                                        continue
+                                    message_id = int(getattr(message, 'id', 0) or 0)
+                                    if message_id > max_seen_message_id:
+                                        max_seen_message_id = message_id
 
                                     text = getattr(message, 'message', None) or getattr(message, 'text', None) or ''
                                     links = self.extract_group_links(text)
 
                                     for link in sorted(links['telegram']):
-                                        # تم إلغاء التحقق الإضافي عبر get_entity/ResolveUsernameRequest
-                                        # لتقليل FloodWait. الآن يتم اعتماد الرابط كما استخرجه regex فقط،
-                                        # مع منع التكرار عبر قاعدة البيانات.
+                                        # لا يوجد أي فحص للرابط نفسه. فقط حفظ ومنع تكرار ثم إرسال.
                                         if self.db.add_collected_link(admin_id, 'telegram', link, dialog.name, account_id):
                                             sent = await self._send_collected_link(client, account_id, telegram_target, 'telegram', link, dialog.name, name)
+                                            cycle_new_telegram += 1
                                             if sent:
                                                 logger.info(f"تم إرسال رابط تليجرام جديد: {link}")
                                                 await asyncio.sleep(5)
@@ -889,11 +990,17 @@ class TelegramBotManager:
                                     for link in sorted(links['whatsapp']):
                                         if self.db.add_collected_link(admin_id, 'whatsapp', link, dialog.name, account_id):
                                             sent = await self._send_collected_link(client, account_id, whatsapp_target, 'whatsapp', link, dialog.name, name)
+                                            cycle_new_whatsapp += 1
                                             if sent:
                                                 logger.info(f"تم إرسال رابط واتساب جديد: {link}")
                                                 await asyncio.sleep(5)
                                             else:
                                                 await asyncio.sleep(2)
+
+                                # نحفظ آخر رسالة شوهدت حتى لا نعيد فحص التاريخ كاملاً في كل دورة.
+                                self.db.update_link_collection_dialog_state(
+                                    admin_id, account_id, dialog_id, max_seen_message_id, True
+                                )
 
                             except Exception as e:
                                 logger.error(f"فشل فحص {dialog.name}: {str(e)}")
@@ -910,6 +1017,17 @@ class TelegramBotManager:
                                 pass
                         continue
 
+                if self.link_collection_active and not self.link_collection_initial_cycle_notified:
+                    await self._notify_initial_collection_finished(
+                        admin_id=admin_id,
+                        scanned_accounts=scanned_accounts,
+                        scanned_dialogs=scanned_dialogs,
+                        historical_dialogs=historical_dialogs,
+                        new_telegram=cycle_new_telegram,
+                        new_whatsapp=cycle_new_whatsapp,
+                    )
+                    self.link_collection_initial_cycle_notified = True
+
                 await self._controlled_sleep(scan_interval, 'link_collection_active')
 
             except Exception as e:
@@ -921,6 +1039,7 @@ class TelegramBotManager:
         if not self.link_collection_active:
             self.link_collection_active = True
             self.link_collection_admin_id = admin_id
+            self.link_collection_initial_cycle_notified = False
             self.link_collection_thread = Thread(
                 target=lambda: asyncio.run(self.collect_links_from_accounts(admin_id)),
                 daemon=True
@@ -944,6 +1063,7 @@ class TelegramBotManager:
         self.link_collection_seen_messages.clear()
         self._send_target_cache.clear()
         self._send_target_flood_until.clear()
+        self.link_collection_initial_cycle_notified = False
         return True
 
     async def test_session(self, session_string):
@@ -1934,7 +2054,7 @@ class BotHandler:
         text = (
             "🔗 **تجميع الروابط**\n\n"
             "هذه الخاصية تفحص رسائل المجموعات والقنوات الموجودة في الحسابات المضافة، "
-            "وتستخرج فقط روابط مجموعات واتساب وروابط تليجرام العامة أو الخاصة.\n\n"
+            "وتستخرج روابط واتساب وروابط تليجرام بدون فتحها أو التحقق منها، مع تجاهل روابط تليجرام التي تنتهي بـ bot.\n\n"
             f"الحالة: {status}\n"
             f"روابط تليجرام المجمعة: `{telegram_count}`\n"
             f"روابط واتساب المجمعة: `{whatsapp_count}`\n\n"
@@ -2053,7 +2173,7 @@ class BotHandler:
         if self.manager.start_link_collection(admin_id):
             await query.edit_message_text(
                 "🚀 تم بدء تجميع الروابط.\n\n"
-                "سيتم فحص المجموعات والقنوات في الحسابات المضافة وإرسال روابط تليجرام وواتساب إلى الوجهات المحددة."
+                "سيتم فحص كل الرسائل المتاحة في المجموعات والقنوات أول مرة، ثم يستمر البوت في التقاط الروابط الجديدة فقط.\n\nلن يتم فتح الروابط أو التحقق منها، وسيتم تجاهل روابط تليجرام التي تنتهي بـ bot."
             )
         else:
             await query.edit_message_text("⚠️ تجميع الروابط يعمل بالفعل.")
